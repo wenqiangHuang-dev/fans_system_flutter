@@ -16,9 +16,10 @@ workflows:
           pwd
           ls -la
           find ios -name "*.xcscheme" -print
-          xcodebuild -list -workspace "$XCODE_WORKSPACE"
       - name: Install Flutter dependencies
-        script: flutter pub get
+        script: |
+          flutter pub get
+          flutter precache --ios
       - name: Build unsigned iOS app
         script: flutter build ios --release --no-codesign
     artifacts:
@@ -42,9 +43,10 @@ workflows:
           pwd
           ls -la
           find ios -name "*.xcscheme" -print
-          xcodebuild -list -workspace "$XCODE_WORKSPACE"
       - name: Install Flutter dependencies
-        script: flutter pub get
+        script: |
+          flutter pub get
+          flutter precache --ios
       - name: Build signed ipa
         script: flutter build ipa --release
     artifacts:
