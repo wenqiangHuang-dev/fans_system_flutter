@@ -4,6 +4,9 @@ workflows:
     max_build_duration: 60
     instance_type: mac_mini_m2
     environment:
+      ios_signing:
+        distribution_type: ad_hoc
+        bundle_identifier: com.example.mobileClient
       flutter: stable
       xcode: latest
       cocoapods: default
@@ -47,8 +50,12 @@ workflows:
         script: |
           flutter pub get
           flutter precache --ios
+      - name: Set up code signing settings
+        script: xcode-project use-profiles --project ios/Runner.xcodeproj
       - name: Build signed ipa
-        script: flutter build ipa --release
+        script: |
+          flutter build ipa --release \
+            --export-options-plist=/Users/builder/export_options.plist
     artifacts:
       - build/ios/ipa/*.ipa
       - /tmp/xcodebuild_logs/*.log

@@ -5,11 +5,11 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
-const String kServerBaseUrl = 'http://154.64.245.24';
+const String kServerBaseUrl = 'http://154.64.245.24/';
+String get kApiBaseUrl => kServerBaseUrl.replaceFirst(RegExp(r'/+$'), '');
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -170,7 +170,7 @@ class _MainShellState extends State<MainShell> {
             HomePage(controller: widget.controller),
             InstructionPage(controller: widget.controller),
             const CommentConfigPage(),
-            WorkModePage(
+            WorkModeControlPage(
               controller: widget.controller,
               active: currentIndex == 3,
             ),
@@ -255,7 +255,7 @@ class ClientController extends ChangeNotifier {
     final loginUsername = inputUsername.trim();
     final loginPassword = inputPassword.trim();
     if (loginUsername.isEmpty || loginPassword.isEmpty) {
-      statusMessage = '请输入管理员账号和密码';
+      statusMessage = '请输入用户账号和密码';
       _notify();
       return;
     }
@@ -267,7 +267,7 @@ class ClientController extends ChangeNotifier {
     try {
       final response = await http
           .post(
-            Uri.parse('$kServerBaseUrl/api/client/auth/login'),
+            Uri.parse('$kApiBaseUrl/api/client/auth/login'),
             headers: const {
               'Content-Type': 'application/json',
               'Accept': 'application/json',
@@ -315,7 +315,7 @@ class ClientController extends ChangeNotifier {
     try {
       await http
           .post(
-            Uri.parse('$kServerBaseUrl/api/client/auth/logout'),
+            Uri.parse('$kApiBaseUrl/api/client/auth/logout'),
             headers: const {
               'Content-Type': 'application/json',
               'Accept': 'application/json',
@@ -343,62 +343,48 @@ class ClientController extends ChangeNotifier {
     await fetchState();
   }
 
-  Future<ClientImportResult> bindImportAccounts(
-    List<ImportUserCredential> importUsers,
-  ) async {
-    final users = importUsers
-        .where(
-          (user) =>
-              user.username.trim().isNotEmpty &&
-              user.password.trim().isNotEmpty,
-        )
-        .toList();
-    if (users.isEmpty) {
-      return const ClientImportResult(
-        successCount: 0,
-        failureCount: 0,
-        accounts: <AccountModel>[],
-        failures: <ImportFailureModel>[],
-      );
+  Future<void> setWorkModeRunning(bool running) async {
+    if (!loggedIn) {
+      throw Exception('请先登录客户端');
+    }
+    if (accounts.isEmpty) {
+      throw Exception('账号未绑定，请重新登录客户端');
     }
 
-    final response = await http
-        .post(
-          Uri.parse('$kServerBaseUrl/api/client/import/bind'),
-          headers: const {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-          },
-          body: jsonEncode(<String, dynamic>{
-            'deviceId': deviceId,
-            'users': users
-                .map(
-                  (user) => <String, dynamic>{
-                    'username': user.username.trim(),
-                    'password': user.password.trim(),
-                  },
-                )
-                .toList(),
-          }),
-        )
-        .timeout(const Duration(seconds: 10));
+    busy = true;
+    statusMessage = running ? '正在启动工作模式' : '正在暂停工作模式';
+    _notify();
 
-    final payload = _readApiPayload(response, '导入绑定失败，请稍后重试');
-    if (payload['success'] != true) {
-      throw Exception(_readApiMessage(payload, '导入绑定失败，请稍后重试'));
-    }
+    try {
+      final endpoint = running ? 'start' : 'pause';
+      final response = await http
+          .post(
+            Uri.parse('$kApiBaseUrl/api/client/work-mode/$endpoint'),
+            headers: const {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+            body: jsonEncode(<String, dynamic>{'deviceId': deviceId}),
+          )
+          .timeout(const Duration(seconds: 10));
 
-    final data = payload['data'];
-    if (data is Map) {
-      final result = ClientImportResult.fromJson(
-        Map<String, dynamic>.from(data),
-      );
-      _applyAccounts(result.accounts);
-      statusMessage = '导入绑定完成';
+      final fallbackMessage = running ? '启动工作模式失败，请稍后重试' : '暂停工作模式失败，请稍后重试';
+      final payload = _readApiPayload(response, fallbackMessage);
+      if (payload['success'] != true) {
+        throw Exception(_readApiMessage(payload, fallbackMessage));
+      }
+
+      _applyState(payload['data']);
+      statusMessage = running ? '工作模式已启动' : '工作模式已暂停';
+    } catch (error) {
+      statusMessage = running
+          ? '启动工作模式失败：${_formatError(error)}'
+          : '暂停工作模式失败：${_formatError(error)}';
+      rethrow;
+    } finally {
+      busy = false;
       _notify();
-      return result;
     }
-    throw Exception('接口返回格式错误');
   }
 
   Future<void> fetchState({
@@ -417,7 +403,7 @@ class ClientController extends ChangeNotifier {
 
     try {
       final uri = Uri.parse(
-        '$kServerBaseUrl/api/client/state',
+        '$kApiBaseUrl/api/client/state',
       ).replace(queryParameters: <String, String>{'deviceId': deviceId});
       final response = await http
           .get(uri, headers: const {'Accept': 'application/json'})
@@ -462,8 +448,8 @@ class ClientController extends ChangeNotifier {
       return;
     }
 
-    final uri = Uri.parse(kServerBaseUrl).replace(
-      scheme: Uri.parse(kServerBaseUrl).scheme == 'https' ? 'wss' : 'ws',
+    final uri = Uri.parse(kApiBaseUrl).replace(
+      scheme: Uri.parse(kApiBaseUrl).scheme == 'https' ? 'wss' : 'ws',
       path: '/ws/client-control',
       queryParameters: <String, String>{'deviceId': deviceId},
     );
@@ -740,9 +726,9 @@ class ClientInstructionModel {
     return const ClientInstructionModel(
       title: '操作说明',
       content:
-          '1. 使用后台创建的管理员账号和密码登录客户端。\n'
-          '2. 在首页导入与后台相同的 txt 文件，文件格式为一行一个用户：用户名 密码。\n'
-          '3. 只有后台已存在且密码匹配的用户会绑定成功，并开始按后台配置增长粉丝。\n'
+          '1. 使用后台导入的用户名和系统分配的 5 位数字密码登录客户端。\n'
+          '2. 登录成功后账号自动激活，并绑定当前设备。\n'
+          '3. 需要进入工作模式点击启动后，才会开始缓慢增长粉丝。\n'
           '4. 如需调整说明内容，请在后台管理端的客户端配置中修改。',
     );
   }
@@ -830,75 +816,6 @@ class AccountModel {
   }
 }
 
-class ClientImportResult {
-  const ClientImportResult({
-    required this.successCount,
-    required this.failureCount,
-    required this.accounts,
-    required this.failures,
-  });
-
-  final int successCount;
-  final int failureCount;
-  final List<AccountModel> accounts;
-  final List<ImportFailureModel> failures;
-
-  factory ClientImportResult.fromJson(Map<String, dynamic> json) {
-    final accountsValue = json['accounts'];
-    final failuresValue = json['failures'];
-    return ClientImportResult(
-      successCount: AccountModel._readInt(json['successCount']),
-      failureCount: AccountModel._readInt(json['failureCount']),
-      accounts: accountsValue is List
-          ? accountsValue
-                .whereType<Map>()
-                .map(
-                  (item) =>
-                      AccountModel.fromJson(Map<String, dynamic>.from(item)),
-                )
-                .toList()
-          : <AccountModel>[],
-      failures: failuresValue is List
-          ? failuresValue
-                .whereType<Map>()
-                .map(
-                  (item) => ImportFailureModel.fromJson(
-                    Map<String, dynamic>.from(item),
-                  ),
-                )
-                .toList()
-          : <ImportFailureModel>[],
-    );
-  }
-}
-
-class ImportFailureModel {
-  const ImportFailureModel({
-    required this.lineNo,
-    required this.content,
-    required this.reason,
-  });
-
-  final int lineNo;
-  final String content;
-  final String reason;
-
-  factory ImportFailureModel.fromJson(Map<String, dynamic> json) {
-    return ImportFailureModel(
-      lineNo: AccountModel._readInt(json['lineNo']),
-      content: '${json['content'] ?? ''}',
-      reason: '${json['reason'] ?? ''}',
-    );
-  }
-}
-
-class ImportUserCredential {
-  const ImportUserCredential({required this.username, required this.password});
-
-  final String username;
-  final String password;
-}
-
 class SplashPage extends StatelessWidget {
   const SplashPage({super.key});
 
@@ -923,169 +840,143 @@ class SplashPage extends StatelessWidget {
   }
 }
 
-class HomePage extends StatefulWidget {
+class HomePage extends StatelessWidget {
   const HomePage({super.key, required this.controller});
 
   final ClientController controller;
 
   @override
-  State<HomePage> createState() => _HomePageState();
-}
-
-class _HomePageState extends State<HomePage> {
-  final List<AccountModel> users = <AccountModel>[];
-  bool importing = false;
-
-  Future<void> _pickAndValidateImportFile() async {
-    if (importing) {
-      return;
-    }
-
-    try {
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: const ['txt'],
-        withData: true,
-      );
-      if (result == null || result.files.isEmpty) {
-        return;
-      }
-
-      final file = result.files.single;
-      final bytes = file.bytes;
-      if (bytes == null || bytes.isEmpty) {
-        _showMessage('文件内容为空');
-        return;
-      }
-
-      final rows = _parseUsers(utf8.decode(bytes, allowMalformed: true));
-      if (rows.isEmpty) {
-        _showMessage('没有识别到可导入的账号');
-        return;
-      }
-
-      setState(() => importing = true);
-      final importResult = await widget.controller.bindImportAccounts(rows);
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        users
-          ..clear()
-          ..addAll(importResult.accounts);
-      });
-
-      _showMessage(
-        '导入完成，成功 ${importResult.successCount} 条，失败 ${importResult.failureCount} 条',
-      );
-    } catch (error) {
-      _showMessage('导入失败：${widget.controller.formatError(error)}');
-    } finally {
-      if (mounted) {
-        setState(() => importing = false);
-      }
-    }
-  }
-
-  List<ImportUserCredential> _parseUsers(String rawText) {
-    final lines = rawText
-        .split(RegExp(r'\r?\n'))
-        .map((line) => line.trim())
-        .where((line) => line.isNotEmpty);
-    final parsedUsers = <ImportUserCredential>[];
-
-    for (final line in lines) {
-      final parts = line
-          .split(RegExp(r'\s+'))
-          .map((part) => part.trim())
-          .where((part) => part.isNotEmpty)
-          .toList();
-      if (parts.length != 2) {
-        continue;
-      }
-
-      final accountName = parts[0];
-      final normalizedHeader = accountName.toLowerCase();
-      if (normalizedHeader == 'username' ||
-          normalizedHeader == 'account' ||
-          normalizedHeader == 'accountname' ||
-          normalizedHeader == 'account_name' ||
-          accountName == '用户名' ||
-          accountName == '账号') {
-        continue;
-      }
-      parsedUsers.add(
-        ImportUserCredential(username: accountName, password: parts[1]),
-      );
-    }
-
-    return parsedUsers;
-  }
-
-  void _showMessage(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final totalFans = controller.accounts.fold<int>(
+      0,
+      (sum, account) => sum + account.currentFans,
+    );
+    final runningCount = controller.accounts
+        .where((account) => account.growthStarted)
+        .length;
+    return RefreshIndicator(
+      onRefresh: controller.refreshNow,
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '账号运行看板',
+                    style: theme.textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '查看当前设备已绑定的账号状态，涨粉由工作模式统一启动或暂停。',
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _HomeSummaryTile(
+                          label: '绑定账号',
+                          value: '${controller.accounts.length}',
+                          icon: Icons.group_outlined,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _HomeSummaryTile(
+                          label: '运行中',
+                          value: '$runningCount',
+                          icon: Icons.play_circle_outline,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _HomeSummaryTile(
+                          label: '粉丝总量',
+                          value: '$totalFans',
+                          icon: Icons.favorite_border,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
+          if (controller.accounts.isEmpty)
+            const _HomeEmptyState()
+          else
+            _UserListCard(users: controller.accounts),
+        ],
+      ),
     );
   }
+}
+
+class _HomeSummaryTile extends StatelessWidget {
+  const _HomeSummaryTile({
+    required this.label,
+    required this.value,
+    required this.icon,
+  });
+
+  final String label;
+  final String value;
+  final IconData icon;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final displayedUsers = users.isEmpty ? widget.controller.accounts : users;
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '用户导入',
-                  style: theme.textTheme.titleLarge?.copyWith(
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  '导入后会在下方展示用户列表。',
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-                const SizedBox(height: 16),
-                FilledButton.icon(
-                  onPressed: importing ? null : _pickAndValidateImportFile,
-                  icon: importing
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.upload_file_outlined),
-                  label: Text(importing ? '导入中' : '选择同一份 txt 导入'),
-                ),
-              ],
+    return Container(
+      constraints: const BoxConstraints(minHeight: 76),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF6F9FC),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xFFE0E7F2)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 18, color: theme.colorScheme.primary),
+          const SizedBox(height: 8),
+          Text(
+            value,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.titleMedium?.copyWith(
+              fontWeight: FontWeight.w900,
+              color: const Color(0xFF152033),
             ),
           ),
-        ),
-        const SizedBox(height: 14),
-        if (displayedUsers.isEmpty && !importing)
-          const _HomeEmptyState()
-        else
-          _UserListCard(users: displayedUsers, importing: importing),
-      ],
+          const SizedBox(height: 2),
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
 
 class _UserListCard extends StatelessWidget {
-  const _UserListCard({required this.users, required this.importing});
+  const _UserListCard({required this.users});
 
   final List<AccountModel> users;
-  final bool importing;
 
   @override
   Widget build(BuildContext context) {
@@ -1100,7 +991,7 @@ class _UserListCard extends StatelessWidget {
               children: [
                 Expanded(
                   child: Text(
-                    '用户列表',
+                    '已激活账号',
                     style: theme.textTheme.titleMedium?.copyWith(
                       fontWeight: FontWeight.w800,
                     ),
@@ -1115,13 +1006,7 @@ class _UserListCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 12),
-            if (importing)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 30),
-                child: Center(child: CircularProgressIndicator()),
-              )
-            else
-              ...users.map((user) => _UserListItem(user: user)),
+            ...users.map((user) => _UserListItem(user: user)),
           ],
         ),
       ),
@@ -1171,7 +1056,14 @@ class _UserListItem extends StatelessWidget {
                 ),
                 const SizedBox(height: 3),
                 Text(
-                  '密码 ${user.loginPassword.isEmpty ? '-' : user.loginPassword} · 当前粉丝 ${user.currentFans} · 每小时增加 ${user.hourlyIncrement}',
+                  '当前粉丝 ${user.currentFans} · ${user.growthStarted ? '工作模式运行中' : '等待启动'}',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '最近同步 ${_formatShortDate(user.updatedAt)}',
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
@@ -1186,6 +1078,11 @@ class _UserListItem extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  String _formatShortDate(String value) {
+    if (value.isEmpty) return '-';
+    return value.replaceFirst('T', ' ').split('.').first;
   }
 }
 
@@ -1206,10 +1103,10 @@ class _HomeEmptyState extends StatelessWidget {
               color: theme.colorScheme.onSurfaceVariant,
             ),
             const SizedBox(height: 12),
-            Text('暂无用户信息', style: theme.textTheme.titleMedium),
+            Text('暂无激活账号', style: theme.textTheme.titleMedium),
             const SizedBox(height: 6),
             Text(
-              '请选择文件导入，或点击模拟导入查看列表效果。',
+              '当前登录状态未返回账号信息，请重新登录客户端。',
               textAlign: TextAlign.center,
               style: theme.textTheme.bodyMedium?.copyWith(
                 color: theme.colorScheme.onSurfaceVariant,
@@ -1279,15 +1176,20 @@ class CommentConfigPage extends StatefulWidget {
 }
 
 class _CommentConfigPageState extends State<CommentConfigPage> {
-  final TextEditingController videoRefreshController = TextEditingController();
-  final TextEditingController commentIntervalController =
-      TextEditingController();
-  final TextEditingController likeIntervalController = TextEditingController();
+  final TextEditingController videoRefreshController = TextEditingController(
+    text: '10',
+  );
+  final TextEditingController commentIntervalController = TextEditingController(
+    text: '6',
+  );
+  final TextEditingController likeIntervalController = TextEditingController(
+    text: '6',
+  );
   final TextEditingController coordinateController = TextEditingController();
   final TextEditingController scriptController = TextEditingController();
 
   bool antiBanEnabled = true;
-  bool vpnEnabled = false;
+  bool vpnEnabled = true;
   bool replyEnabled = true;
   bool followEnabled = true;
 
@@ -1538,6 +1440,256 @@ class _ConfigSwitchTile extends StatelessWidget {
       contentPadding: EdgeInsets.zero,
       title: Text(title),
       subtitle: subtitle == null ? null : Text(subtitle!),
+    );
+  }
+}
+
+class WorkModeControlPage extends StatefulWidget {
+  const WorkModeControlPage({
+    super.key,
+    required this.controller,
+    required this.active,
+  });
+
+  final ClientController controller;
+  final bool active;
+
+  @override
+  State<WorkModeControlPage> createState() => _WorkModeControlPageState();
+}
+
+class _WorkModeControlPageState extends State<WorkModeControlPage> {
+  final ScrollController logScrollController = ScrollController();
+  final List<String> logs = <String>[];
+
+  int startFans = 0;
+  int lastFans = 0;
+  int addedFans = 0;
+  bool actionBusy = false;
+
+  bool get running {
+    return widget.controller.accounts.any((account) => account.growthStarted);
+  }
+
+  bool get hasAccounts {
+    return widget.controller.accounts.isNotEmpty;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _resetCounter('等待启动工作模式');
+    widget.controller.addListener(_handleControllerChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant WorkModeControlPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!oldWidget.active && widget.active) {
+      setState(() => _resetCounter('已进入工作模式页面'));
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_handleControllerChanged);
+    logScrollController.dispose();
+    super.dispose();
+  }
+
+  void _resetCounter(String message) {
+    startFans = widget.controller.displayFans;
+    lastFans = widget.controller.displayFans;
+    addedFans = 0;
+    logs
+      ..clear()
+      ..add('${_formatLogTime(DateTime.now())}: $message');
+  }
+
+  void _handleControllerChanged() {
+    if (!mounted || !widget.active || !widget.controller.loggedIn || !running) {
+      return;
+    }
+
+    final currentFans = widget.controller.displayFans;
+    if (currentFans <= lastFans) {
+      return;
+    }
+
+    final increment = currentFans - lastFans;
+    lastFans = currentFans;
+    addedFans = currentFans - startFans;
+    logs.add(
+      '${_formatLogTime(DateTime.now())}: 粉丝数新增 +$increment，累计新增 $addedFans',
+    );
+    if (logs.length > 200) {
+      logs.removeRange(0, logs.length - 200);
+    }
+
+    setState(() {});
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!logScrollController.hasClients) {
+        return;
+      }
+      logScrollController.animateTo(
+        logScrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 240),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  Future<void> _setRunning(bool nextRunning) async {
+    if (actionBusy) {
+      return;
+    }
+    setState(() => actionBusy = true);
+    try {
+      await widget.controller.setWorkModeRunning(nextRunning);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _resetCounter(nextRunning ? '工作模式已启动，等待粉丝数据更新' : '工作模式已暂停');
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(nextRunning ? '工作模式已启动' : '工作模式已暂停'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(widget.controller.formatError(error)),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => actionBusy = false);
+      }
+    }
+  }
+
+  String _formatLogTime(DateTime value) {
+    final year = value.year.toString().padLeft(4, '0');
+    final month = value.month.toString().padLeft(2, '0');
+    final day = value.day.toString().padLeft(2, '0');
+    final hour = value.hour.toString().padLeft(2, '0');
+    final minute = value.minute.toString().padLeft(2, '0');
+    final second = value.second.toString().padLeft(2, '0');
+    final millisecond = value.millisecond.toString().padLeft(3, '0');
+    return '$year-$month-$day $hour:$minute:$second:$millisecond';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isRunning = running;
+    return Column(
+      children: [
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.fromLTRB(16, 18, 16, 16),
+          color: Colors.white,
+          child: Column(
+            children: [
+              Text(
+                '$addedFans',
+                style: theme.textTheme.displaySmall?.copyWith(
+                  fontWeight: FontWeight.w900,
+                  color: const Color(0xFF152033),
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '本次工作模式新增粉丝',
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: actionBusy || !hasAccounts || isRunning
+                          ? null
+                          : () => _setRunning(true),
+                      icon: actionBusy && !isRunning
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.play_arrow_rounded),
+                      label: const Text('启动增长'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: actionBusy || !hasAccounts || !isRunning
+                          ? null
+                          : () => _setRunning(false),
+                      icon: const Icon(Icons.pause_rounded),
+                      label: const Text('暂停增长'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Text(
+                hasAccounts
+                    ? (isRunning ? '当前状态：运行中' : '当前状态：已暂停')
+                    : '账号未绑定，请重新登录客户端',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: isRunning
+                      ? const Color(0xFF147850)
+                      : theme.colorScheme.onSurfaceVariant,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: const Color(0xFF101828),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFF263244)),
+              ),
+              child: ListView.builder(
+                controller: logScrollController,
+                itemCount: logs.length,
+                itemBuilder: (context, index) {
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Text(
+                      logs[index],
+                      style: const TextStyle(
+                        color: Color(0xFFE6EDF7),
+                        fontSize: 13,
+                        height: 1.45,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -1807,12 +1959,12 @@ class _MinePageState extends State<MinePage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Text('管理员登录', style: theme.textTheme.titleLarge),
+                Text('用户登录', style: theme.textTheme.titleLarge),
                 const SizedBox(height: 20),
                 TextField(
                   controller: usernameController,
                   decoration: const InputDecoration(
-                    labelText: '管理员账号',
+                    labelText: '用户账号',
                     prefixIcon: Icon(Icons.person_outline),
                   ),
                   textInputAction: TextInputAction.next,
@@ -1821,9 +1973,14 @@ class _MinePageState extends State<MinePage> {
                 TextField(
                   controller: passwordController,
                   decoration: const InputDecoration(
-                    labelText: '管理员密码',
+                    labelText: '5位数字密码',
                     prefixIcon: Icon(Icons.lock_outline),
                   ),
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.digitsOnly,
+                    LengthLimitingTextInputFormatter(5),
+                  ],
                   obscureText: true,
                   textInputAction: TextInputAction.done,
                   onSubmitted: (_) => controller.login(
@@ -2033,7 +2190,7 @@ class AccountCard extends StatelessWidget {
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        account.growthStarted ? '客户端已启动增长' : '等待客户端导入启动',
+                        account.growthStarted ? '客户端已启动增长' : '等待工作模式启动',
                         style: theme.textTheme.bodySmall?.copyWith(
                           color: account.growthStarted
                               ? const Color(0xFF147850)
@@ -2280,7 +2437,7 @@ class _EmptyState extends StatelessWidget {
             Text('暂无可展示账号', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
             Text(
-              '请确认后台已创建账号，并使用该账号登录当前设备。',
+              '当前登录状态未返回账号信息，请重新登录客户端。',
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: Theme.of(context).colorScheme.onSurfaceVariant,
