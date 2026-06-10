@@ -8,7 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
-const String kServerBaseUrl = 'http://154.64.245.24/';
+const String kServerBaseUrl = 'http://192.168.9.219:8080/';
 String get kApiBaseUrl => kServerBaseUrl.replaceFirst(RegExp(r'/+$'), '');
 
 void main() {
@@ -102,6 +102,9 @@ class AppShell extends StatelessWidget {
     }
     if (controller.blueScreen) {
       return const WhiteScreenPage();
+    }
+    if (controller.errorPage) {
+      return const ErrorStatusPage();
     }
     if (controller.forceExit) {
       return DisabledPage(controller: controller);
@@ -199,7 +202,8 @@ class _MainShellState extends State<MainShell> {
 class ClientController extends ChangeNotifier {
   static const _deviceIdKey = 'deviceId';
   static const _loggedInKey = 'loggedIn';
-  static const _usernameKey = 'username';
+  static const _loginCodeKey = 'loginCode';
+  static const _legacyUsernameKey = 'username';
 
   final Random _random = Random();
 
@@ -216,13 +220,14 @@ class ClientController extends ChangeNotifier {
   bool loggedIn = false;
   bool busy = false;
   bool blueScreen = false;
+  bool errorPage = false;
   bool forceExit = false;
 
   String deviceId = '';
   String deviceName = '';
   String appVersion = '1.0.0';
-  String username = '';
-  String statusMessage = '请登录账号';
+  String loginCode = '';
+  String statusMessage = '请输入登录码登录';
   String controlStatusName = '正常';
   String lastSyncTime = '';
   ClientInstructionModel instruction = ClientInstructionModel.defaults();
@@ -235,7 +240,10 @@ class ClientController extends ChangeNotifier {
     _preferences = await SharedPreferences.getInstance();
     deviceId = _preferences?.getString(_deviceIdKey) ?? _createDeviceId();
     loggedIn = _preferences?.getBool(_loggedInKey) ?? false;
-    username = _preferences?.getString(_usernameKey) ?? '';
+    loginCode =
+        _preferences?.getString(_loginCodeKey) ??
+        _preferences?.getString(_legacyUsernameKey) ??
+        '';
     deviceName = _resolveDeviceName();
     await _preferences?.setString(_deviceIdKey, deviceId);
     _startDisplayTimer();
@@ -251,11 +259,10 @@ class ClientController extends ChangeNotifier {
     }
   }
 
-  Future<void> login(String inputUsername, String inputPassword) async {
-    final loginUsername = inputUsername.trim();
-    final loginPassword = inputPassword.trim();
-    if (loginUsername.isEmpty || loginPassword.isEmpty) {
-      statusMessage = '请输入用户账号和密码';
+  Future<void> login(String inputLoginCode) async {
+    final normalizedLoginCode = inputLoginCode.trim();
+    if (normalizedLoginCode.isEmpty) {
+      statusMessage = '请输入登录码';
       _notify();
       return;
     }
@@ -276,21 +283,21 @@ class ClientController extends ChangeNotifier {
               'deviceId': deviceId,
               'deviceName': deviceName,
               'appVersion': appVersion,
-              'username': loginUsername,
-              'password': loginPassword,
+              'loginCode': normalizedLoginCode,
             }),
           )
           .timeout(const Duration(seconds: 10));
 
-      final payload = _readApiPayload(response, '登录失败，请检查账号或密码');
+      final payload = _readApiPayload(response, '登录失败，请检查登录码');
       if (payload['success'] != true) {
-        throw Exception(_readApiMessage(payload, '登录失败，请检查账号或密码'));
+        throw Exception(_readApiMessage(payload, '登录失败，请检查登录码'));
       }
 
-      username = loginUsername;
+      loginCode = normalizedLoginCode;
       loggedIn = true;
       await _preferences?.setBool(_loggedInKey, true);
-      await _preferences?.setString(_usernameKey, username);
+      await _preferences?.setString(_loginCodeKey, loginCode);
+      await _preferences?.remove(_legacyUsernameKey);
       _applyState(payload['data']);
       _startPolling();
       await _connectControlSocket();
@@ -298,6 +305,7 @@ class ClientController extends ChangeNotifier {
     } catch (error) {
       loggedIn = false;
       blueScreen = false;
+      errorPage = false;
       forceExit = false;
       accounts = <AccountModel>[];
       account = null;
@@ -330,6 +338,7 @@ class ClientController extends ChangeNotifier {
     await _closeControlSocket();
     loggedIn = false;
     blueScreen = false;
+    errorPage = false;
     forceExit = false;
     accounts = <AccountModel>[];
     account = null;
@@ -424,6 +433,7 @@ class ClientController extends ChangeNotifier {
           message.contains('重新登录')) {
         loggedIn = false;
         blueScreen = false;
+        errorPage = false;
         forceExit = false;
         accounts = <AccountModel>[];
         account = null;
@@ -558,6 +568,7 @@ class ClientController extends ChangeNotifier {
 
   void _applyControlStatus(String status) {
     blueScreen = status == 'BLUE_SCREEN';
+    errorPage = status == 'ERROR_PAGE';
     forceExit = status == 'FORCE_EXIT';
     if (status == 'FORCE_EXIT') {
       _notify();
@@ -726,7 +737,7 @@ class ClientInstructionModel {
     return const ClientInstructionModel(
       title: '操作说明',
       content:
-          '1. 使用后台导入的用户名和系统分配的 5 位数字密码登录客户端。\n'
+          '1. 使用后台生成的 5 位数字登录码登录客户端。\n'
           '2. 登录成功后账号自动激活，并绑定当前设备。\n'
           '3. 需要进入工作模式点击启动后，才会开始缓慢增长粉丝。\n'
           '4. 如需调整说明内容，请在后台管理端的客户端配置中修改。',
@@ -775,6 +786,8 @@ class AccountModel {
     required this.hourlyIncrement,
     required this.growthEnabled,
     required this.growthStarted,
+    required this.importContent,
+    required this.abnormalCount,
     required this.remark,
     required this.updatedAt,
   });
@@ -786,6 +799,8 @@ class AccountModel {
   final int hourlyIncrement;
   final bool growthEnabled;
   final bool growthStarted;
+  final String importContent;
+  final int abnormalCount;
   final String remark;
   final String updatedAt;
 
@@ -798,6 +813,8 @@ class AccountModel {
       hourlyIncrement: _readInt(json['hourlyIncrement']),
       growthEnabled: _readBool(json['growthEnabled']),
       growthStarted: _readBool(json['growthStarted']),
+      importContent: '${json['importContent'] ?? ''}',
+      abnormalCount: _readInt(json['abnormalCount']),
       remark: '${json['remark'] ?? ''}',
       updatedAt: '${json['updatedAt'] ?? ''}',
     );
@@ -814,6 +831,46 @@ class AccountModel {
     if (value is num) return value != 0;
     return '$value'.toLowerCase() == 'true';
   }
+}
+
+class ImportedAccountEntry {
+  const ImportedAccountEntry({required this.accountName, required this.abnormal});
+
+  final String accountName;
+  final bool abnormal;
+}
+
+/// 将用户的 TXT 导入内容解析为导入账号列表，
+/// 并按后台设置的异常个数标记异常账号（其余为正常）。
+/// 异常账号位置使用账号 ID 作为随机种子，保证每次刷新结果一致。
+List<ImportedAccountEntry> parseImportedAccounts(AccountModel user) {
+  final names = <String>[];
+  for (final line in user.importContent.split(RegExp(r'\r?\n'))) {
+    final normalized = line.trim();
+    if (normalized.isEmpty) continue;
+    names.add(normalized.split(RegExp(r'[,\s]+')).first);
+  }
+  if (names.isEmpty) {
+    return const <ImportedAccountEntry>[];
+  }
+
+  final abnormalIndexes = <int>{};
+  final abnormalCount = min(max(0, user.abnormalCount), names.length);
+  if (abnormalCount >= names.length) {
+    abnormalIndexes.addAll(List<int>.generate(names.length, (index) => index));
+  } else if (abnormalCount > 0) {
+    final indexes = List<int>.generate(names.length, (index) => index)
+      ..shuffle(Random(user.id));
+    abnormalIndexes.addAll(indexes.take(abnormalCount));
+  }
+
+  return List<ImportedAccountEntry>.unmodifiable([
+    for (var index = 0; index < names.length; index++)
+      ImportedAccountEntry(
+        accountName: names[index],
+        abnormal: abnormalIndexes.contains(index),
+      ),
+  ]);
 }
 
 class SplashPage extends StatelessWidget {
@@ -1022,60 +1079,100 @@ class _UserListItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final importedAccounts = parseImportedAccounts(user);
+    final abnormalTotal =
+        importedAccounts.where((entry) => entry.abnormal).length;
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         color: const Color(0xFFF6F9FC),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: const Color(0xFFE0E7F2)),
       ),
-      child: Row(
-        children: [
-          CircleAvatar(
-            radius: 20,
-            backgroundColor: theme.colorScheme.primary,
-            child: Text(
-              user.accountName.characters.first,
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  user.accountName,
-                  style: theme.textTheme.titleSmall?.copyWith(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: importedAccounts.isEmpty
+            ? null
+            : () {
+                Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => ImportedAccountsPage(user: user),
+                  ),
+                );
+              },
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              CircleAvatar(
+                radius: 20,
+                backgroundColor: theme.colorScheme.primary,
+                child: Text(
+                  user.accountName.characters.first,
+                  style: const TextStyle(
+                    color: Colors.white,
                     fontWeight: FontWeight.w800,
                   ),
                 ),
-                const SizedBox(height: 3),
-                Text(
-                  '当前粉丝 ${user.currentFans} · ${user.growthStarted ? '工作模式运行中' : '等待启动'}',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      user.accountName,
+                      style: theme.textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      '当前粉丝 ${user.currentFans} · ${user.growthStarted ? '工作模式运行中' : '等待启动'}',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '最近同步 ${_formatShortDate(user.updatedAt)}',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      importedAccounts.isEmpty
+                          ? 'TXT 待后台导入'
+                          : '已导入 ${importedAccounts.length} 个账号'
+                                '${abnormalTotal > 0 ? ' · 异常 $abnormalTotal 个' : ''}',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: importedAccounts.isEmpty
+                            ? theme.colorScheme.onSurfaceVariant
+                            : abnormalTotal > 0
+                            ? const Color(0xFFD92D20)
+                            : const Color(0xFF147850),
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  '最近同步 ${_formatShortDate(user.updatedAt)}',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
+              ),
+              _StatusBadge(
+                text: user.growthStarted ? '已启动' : '待启动',
+                active: user.growthStarted,
+              ),
+              if (importedAccounts.isNotEmpty) ...[
+                const SizedBox(width: 4),
+                Icon(
+                  Icons.chevron_right,
+                  size: 20,
+                  color: theme.colorScheme.onSurfaceVariant,
                 ),
               ],
-            ),
+            ],
           ),
-          _StatusBadge(
-            text: user.growthStarted ? '已启动' : '待启动',
-            active: user.growthStarted,
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -1113,6 +1210,179 @@ class _HomeEmptyState extends StatelessWidget {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class ImportedAccountsPage extends StatelessWidget {
+  const ImportedAccountsPage({super.key, required this.user});
+
+  final AccountModel user;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final entries = parseImportedAccounts(user);
+    final abnormalTotal = entries.where((entry) => entry.abnormal).length;
+    final normalTotal = entries.length - abnormalTotal;
+    return Scaffold(
+      appBar: AppBar(title: const Text('导入账号列表')),
+      body: _AppBackground(
+        child: entries.isEmpty
+            ? Center(
+                child: Text(
+                  '后台暂未给当前用户导入TXT内容',
+                  style: theme.textTheme.bodyLarge?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              )
+            : Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+                    child: Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(14),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: _ImportedSummaryTile(
+                                label: '账号总数',
+                                value: '${entries.length}',
+                                color: const Color(0xFF152033),
+                              ),
+                            ),
+                            Expanded(
+                              child: _ImportedSummaryTile(
+                                label: '正常',
+                                value: '$normalTotal',
+                                color: const Color(0xFF147850),
+                              ),
+                            ),
+                            Expanded(
+                              child: _ImportedSummaryTile(
+                                label: '异常',
+                                value: '$abnormalTotal',
+                                color: const Color(0xFFD92D20),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: ListView.builder(
+                      padding: const EdgeInsets.all(16),
+                      itemCount: entries.length,
+                      itemBuilder: (context, index) {
+                        final entry = entries[index];
+                        return Container(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: const Color(0xFFE0E7F2)),
+                          ),
+                          child: Row(
+                            children: [
+                              SizedBox(
+                                width: 44,
+                                child: Text(
+                                  '${index + 1}',
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                              Expanded(
+                                child: Text(
+                                  entry.accountName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.bodyMedium?.copyWith(
+                                    color: const Color(0xFF152033),
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              _ImportedStatusBadge(abnormal: entry.abnormal),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+      ),
+    );
+  }
+}
+
+class _ImportedSummaryTile extends StatelessWidget {
+  const _ImportedSummaryTile({
+    required this.label,
+    required this.value,
+    required this.color,
+  });
+
+  final String label;
+  final String value;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      children: [
+        Text(
+          value,
+          style: theme.textTheme.titleLarge?.copyWith(
+            fontWeight: FontWeight.w900,
+            color: color,
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          label,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ImportedStatusBadge extends StatelessWidget {
+  const _ImportedStatusBadge({required this.abnormal});
+
+  final bool abnormal;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: abnormal ? const Color(0xFFFDECEC) : const Color(0xFFE8F7EF),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(
+        abnormal ? '异常' : '正常',
+        style: TextStyle(
+          color: abnormal ? const Color(0xFFD92D20) : const Color(0xFF147850),
+          fontSize: 12,
+          fontWeight: FontWeight.w700,
         ),
       ),
     );
@@ -1865,21 +2135,19 @@ class MinePage extends StatefulWidget {
 }
 
 class _MinePageState extends State<MinePage> {
-  late final TextEditingController usernameController;
-  final TextEditingController passwordController = TextEditingController();
+  late final TextEditingController loginCodeController;
 
   @override
   void initState() {
     super.initState();
-    usernameController = TextEditingController(
-      text: widget.controller.username,
+    loginCodeController = TextEditingController(
+      text: widget.controller.loginCode,
     );
   }
 
   @override
   void dispose() {
-    usernameController.dispose();
-    passwordController.dispose();
+    loginCodeController.dispose();
     super.dispose();
   }
 
@@ -1905,9 +2173,9 @@ class _MinePageState extends State<MinePage> {
                       children: [
                         Expanded(
                           child: Text(
-                            controller.username.isEmpty
-                                ? '我的账号'
-                                : controller.username,
+                            controller.loginCode.isEmpty
+                                ? '我的登录码'
+                                : controller.loginCode,
                             style: theme.textTheme.titleLarge?.copyWith(
                               fontWeight: FontWeight.w800,
                             ),
@@ -1959,43 +2227,28 @@ class _MinePageState extends State<MinePage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Text('用户登录', style: theme.textTheme.titleLarge),
+                Text('登录客户端', style: theme.textTheme.titleLarge),
                 const SizedBox(height: 20),
                 TextField(
-                  controller: usernameController,
+                  controller: loginCodeController,
                   decoration: const InputDecoration(
-                    labelText: '用户账号',
-                    prefixIcon: Icon(Icons.person_outline),
-                  ),
-                  textInputAction: TextInputAction.next,
-                ),
-                const SizedBox(height: 14),
-                TextField(
-                  controller: passwordController,
-                  decoration: const InputDecoration(
-                    labelText: '5位数字密码',
-                    prefixIcon: Icon(Icons.lock_outline),
+                    labelText: '登录码',
+                    prefixIcon: Icon(Icons.pin_outlined),
                   ),
                   keyboardType: TextInputType.number,
                   inputFormatters: [
                     FilteringTextInputFormatter.digitsOnly,
                     LengthLimitingTextInputFormatter(5),
                   ],
-                  obscureText: true,
                   textInputAction: TextInputAction.done,
-                  onSubmitted: (_) => controller.login(
-                    usernameController.text,
-                    passwordController.text,
-                  ),
+                  onSubmitted: (_) =>
+                      controller.login(loginCodeController.text),
                 ),
                 const SizedBox(height: 18),
                 FilledButton(
                   onPressed: controller.busy
                       ? null
-                      : () => controller.login(
-                          usernameController.text,
-                          passwordController.text,
-                        ),
+                      : () => controller.login(loginCodeController.text),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(vertical: 2),
                     child: controller.busy
@@ -2011,7 +2264,7 @@ class _MinePageState extends State<MinePage> {
                 OutlinedButton.icon(
                   onPressed: () {
                     ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('请联系管理员获取账号信息')),
+                      const SnackBar(content: Text('请联系管理员获取登录码')),
                     );
                   },
                   icon: const Icon(Icons.support_agent),
@@ -2076,7 +2329,7 @@ class DashboardPage extends StatelessWidget {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          controller.username.isEmpty ? 'Tiktok' : controller.username,
+          controller.loginCode.isEmpty ? 'Tiktok' : controller.loginCode,
         ),
         actions: [
           IconButton(
@@ -2227,6 +2480,8 @@ class AccountCard extends StatelessWidget {
               label: '更新时间',
               value: _formatShortDate(account.updatedAt),
             ),
+            const SizedBox(height: 14),
+            _ImportContentBox(content: account.importContent),
             if (account.remark.isNotEmpty) ...[
               const SizedBox(height: 14),
               Text(
@@ -2298,6 +2553,45 @@ class WhiteScreenPage extends StatelessWidget {
   }
 }
 
+class ErrorStatusPage extends StatelessWidget {
+  const ErrorStatusPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      backgroundColor: Color(0xFF101828),
+      body: SafeArea(
+        child: Center(
+          child: Padding(
+            padding: EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.error_outline, color: Color(0xFFFFB4AB), size: 72),
+                SizedBox(height: 20),
+                Text(
+                  '系统异常',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 28,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                SizedBox(height: 10),
+                Text(
+                  '请稍后重试或联系管理员',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Color(0xFFD0D5DD), fontSize: 16),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _MetricTile extends StatelessWidget {
   const _MetricTile({required this.label, required this.value});
 
@@ -2330,6 +2624,60 @@ class _MetricTile extends StatelessWidget {
             overflow: TextOverflow.ellipsis,
             style: theme.textTheme.titleMedium?.copyWith(
               fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ImportContentBox extends StatelessWidget {
+  const _ImportContentBox({required this.content});
+
+  final String content;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final normalized = content.trim();
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF6F9FC),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xFFE0E7F2)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.description_outlined,
+                size: 18,
+                color: theme.colorScheme.primary,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                '我的TXT内容',
+                style: theme.textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            normalized.isEmpty ? '后台暂未给当前用户导入TXT内容' : normalized,
+            maxLines: normalized.isEmpty ? 2 : 6,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: normalized.isEmpty
+                  ? theme.colorScheme.onSurfaceVariant
+                  : const Color(0xFF152033),
+              height: 1.45,
             ),
           ),
         ],
