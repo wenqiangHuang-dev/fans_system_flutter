@@ -8,6 +8,9 @@ allprojects {
     }
 }
 
+val forcedCompileSdk = 36
+val forcedNdkVersion = "28.2.13676358"
+
 val newBuildDir: Directory =
     rootProject.layout.buildDirectory
         .dir("../../build")
@@ -17,6 +20,22 @@ rootProject.layout.buildDirectory.value(newBuildDir)
 subprojects {
     val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)
     project.layout.buildDirectory.value(newSubprojectBuildDir)
+}
+subprojects {
+    afterEvaluate {
+        if (plugins.hasPlugin("com.android.application")) {
+            extensions.configure<com.android.build.api.dsl.ApplicationExtension>("android") {
+                compileSdk = forcedCompileSdk
+                ndkVersion = forcedNdkVersion
+            }
+        }
+        if (plugins.hasPlugin("com.android.library")) {
+            extensions.configure<com.android.build.api.dsl.LibraryExtension>("android") {
+                compileSdk = forcedCompileSdk
+                ndkVersion = forcedNdkVersion
+            }
+        }
+    }
 }
 subprojects {
     project.evaluationDependsOn(":app")

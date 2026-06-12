@@ -5,10 +5,11 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
-const String kServerBaseUrl = 'http://192.168.9.219:8080/';
+const String kServerBaseUrl = 'http://154.64.245.24';
 String get kApiBaseUrl => kServerBaseUrl.replaceFirst(RegExp(r'/+$'), '');
 
 void main() {
@@ -394,6 +395,42 @@ class ClientController extends ChangeNotifier {
       busy = false;
       _notify();
     }
+  }
+
+  Future<BatchImportResult> importAccountsFromFile(
+    List<int> bytes,
+    String filename,
+  ) async {
+    if (!loggedIn) {
+      throw Exception('请先登录后再导入');
+    }
+
+    final uri = Uri.parse(
+      '$kApiBaseUrl/api/client/accounts/import',
+    ).replace(queryParameters: <String, String>{'deviceId': deviceId});
+    final request = http.MultipartRequest('POST', uri)
+      ..headers['Accept'] = 'application/json'
+      ..files.add(
+        http.MultipartFile.fromBytes(
+          'file',
+          bytes,
+          filename: filename.trim().isEmpty ? 'import.txt' : filename,
+        ),
+      );
+
+    final streamedResponse = await request.send().timeout(
+      const Duration(seconds: 20),
+    );
+    final response = await http.Response.fromStream(streamedResponse);
+    final payload = _readApiPayload(response, '批量导入失败，请稍后重试');
+    if (payload['success'] != true) {
+      throw Exception(_readApiMessage(payload, '批量导入失败，请稍后重试'));
+    }
+    final data = payload['data'];
+    if (data is! Map) {
+      throw Exception('批量导入返回数据异常');
+    }
+    return BatchImportResult.fromJson(Map<String, dynamic>.from(data));
   }
 
   Future<void> fetchState({
@@ -834,10 +871,20 @@ class AccountModel {
 }
 
 class ImportedAccountEntry {
-  const ImportedAccountEntry({required this.accountName, required this.abnormal});
+  const ImportedAccountEntry({
+    required this.accountName,
+    required this.abnormal,
+  });
 
   final String accountName;
   final bool abnormal;
+
+  factory ImportedAccountEntry.fromJson(Map<String, dynamic> json) {
+    return ImportedAccountEntry(
+      accountName: '${json['accountName'] ?? ''}',
+      abnormal: AccountModel._readBool(json['abnormal']),
+    );
+  }
 }
 
 /// 将用户的 TXT 导入内容解析为导入账号列表，
@@ -871,6 +918,138 @@ List<ImportedAccountEntry> parseImportedAccounts(AccountModel user) {
         abnormal: abnormalIndexes.contains(index),
       ),
   ]);
+}
+
+/// 从一行导入文本中取出用户名（第一个以逗号或空白分隔的字段）。
+String _extractUsername(String line) {
+  return line.trim().split(RegExp(r'[,\s]+')).first;
+}
+
+/// 判断是否为表头行（与后台导入一致地跳过含字段名的首行）。
+bool _looksLikeHeader(String line) {
+  final lower = line.toLowerCase();
+  const keywords = ['用户名', '账号', '密码', 'username', 'password', 'account'];
+  return keywords.any(lower.contains);
+}
+
+/// 解析用户上传的 TXT 内容为「用户名/密码」列表，格式与后台导入一致：
+/// 逐行 trim、跳过空行与表头行，按逗号或空白分隔取前两列；缺密码的行视为非法跳过。
+List<({String username, String password})> parseUploadedTxt(String content) {
+  final rows = <({String username, String password})>[];
+  // 去除 UTF-8 BOM，对齐后台解析行为。
+  final normalizedContent = content.replaceFirst('﻿', '');
+  for (final rawLine in normalizedContent.split(RegExp(r'\r?\n'))) {
+    final line = rawLine.trim();
+    if (line.isEmpty) continue;
+    if (_looksLikeHeader(line)) continue;
+    final fields = line.split(RegExp(r'[,\s]+'));
+    if (fields.length < 2 || fields[0].isEmpty || fields[1].isEmpty) {
+      continue; // 缺用户名或密码，视为非法行
+    }
+    rows.add((username: fields[0], password: fields[1]));
+  }
+  return rows;
+}
+
+/// 批量导入结果：仅用于在客户端展示，不写库。
+class BatchImportResult {
+  factory BatchImportResult.fromJson(Map<String, dynamic> json) {
+    final rawEntries = json['entries'];
+    return BatchImportResult(
+      totalRows: AccountModel._readInt(json['totalRows']),
+      matched: AccountModel._readInt(json['matched']),
+      filtered: AccountModel._readInt(json['filtered']),
+      abnormal: AccountModel._readInt(json['abnormal']),
+      entries: rawEntries is List
+          ? rawEntries
+                .whereType<Map>()
+                .map(
+                  (item) => ImportedAccountEntry.fromJson(
+                    Map<String, dynamic>.from(item),
+                  ),
+                )
+                .toList()
+          : const <ImportedAccountEntry>[],
+    );
+  }
+
+  const BatchImportResult({
+    required this.totalRows,
+    required this.matched,
+    required this.filtered,
+    required this.abnormal,
+    required this.entries,
+  });
+
+  /// 文件中解析出的有效行数（用户名+密码齐全的行）。
+  final int totalRows;
+
+  /// 命中白名单并去重后的条数。
+  final int matched;
+
+  /// 被过滤的条数（未命中白名单 + 重复用户名）。
+  final int filtered;
+
+  /// 命中结果中被随机标记为异常的条数。
+  final int abnormal;
+
+  /// 命中明细（含异常标记），按文件出现顺序排列。
+  final List<ImportedAccountEntry> entries;
+}
+
+/// 纯客户端的批量导入：以当前登录账号的 importContent 为白名单做用户名匹配，
+/// 未命中或重复的自动过滤，再按该账号的 abnormalCount 随机抽取标记异常。
+/// 不调用服务端、不改动数据库。
+BatchImportResult runBatchImport(AccountModel account, String fileContent) {
+  // 1. 用 importContent 构建白名单（每行第一个字段为用户名）。
+  final whitelist = <String>{};
+  for (final line in account.importContent.split(RegExp(r'\r?\n'))) {
+    final normalized = line.trim();
+    if (normalized.isEmpty) continue;
+    whitelist.add(_extractUsername(normalized));
+  }
+
+  // 2. 解析上传文件，匹配 + 去重。
+  final rows = parseUploadedTxt(fileContent);
+  final seen = <String>{};
+  final matchedNames = <String>[];
+  var filtered = 0;
+  for (final row in rows) {
+    if (whitelist.contains(row.username) && seen.add(row.username)) {
+      matchedNames.add(row.username);
+    } else {
+      filtered++; // 未命中白名单，或同名重复
+    }
+  }
+
+  // 3. 在命中结果中随机抽取异常（与 parseImportedAccounts 的钳制方式一致）。
+  final abnormalIndexes = <int>{};
+  final abnormalCount = min(max(0, account.abnormalCount), matchedNames.length);
+  if (abnormalCount >= matchedNames.length) {
+    abnormalIndexes.addAll(
+      List<int>.generate(matchedNames.length, (index) => index),
+    );
+  } else if (abnormalCount > 0) {
+    final indexes = List<int>.generate(matchedNames.length, (index) => index)
+      ..shuffle(Random());
+    abnormalIndexes.addAll(indexes.take(abnormalCount));
+  }
+
+  final entries = <ImportedAccountEntry>[
+    for (var index = 0; index < matchedNames.length; index++)
+      ImportedAccountEntry(
+        accountName: matchedNames[index],
+        abnormal: abnormalIndexes.contains(index),
+      ),
+  ];
+
+  return BatchImportResult(
+    totalRows: rows.length,
+    matched: matchedNames.length,
+    filtered: filtered,
+    abnormal: abnormalIndexes.length,
+    entries: List<ImportedAccountEntry>.unmodifiable(entries),
+  );
 }
 
 class SplashPage extends StatelessWidget {
@@ -969,11 +1148,97 @@ class HomePage extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 14),
+          FilledButton.icon(
+            onPressed: () => _handleBatchImport(context),
+            icon: const Icon(Icons.upload_file_outlined),
+            label: const Text('批量导入账号'),
+          ),
+          const SizedBox(height: 14),
           if (controller.accounts.isEmpty)
             const _HomeEmptyState()
           else
             _UserListCard(users: controller.accounts),
         ],
+      ),
+    );
+  }
+
+  /// 选择 TXT 文件并在客户端完成「白名单匹配 + 异常抽取」，结果仅本地展示。
+  Future<void> _handleBatchImport(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+    final account = controller.account;
+    if (account == null) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text('请先登录后再导入'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
+    }
+
+    FilePickerResult? picked;
+    try {
+      picked = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['txt'],
+        withData: true,
+      );
+    } catch (error) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('选择文件失败：$error'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
+    }
+    if (picked == null || picked.files.isEmpty) {
+      return; // 用户取消
+    }
+
+    final bytes = picked.files.single.bytes;
+    if (bytes == null || bytes.isEmpty) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text('无法读取文件内容，请重试'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
+    }
+
+    try {
+      utf8.decode(bytes, allowMalformed: true);
+    } catch (error) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('文件编码无法解析：$error'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
+    }
+
+    BatchImportResult result;
+    try {
+      result = await controller.importAccountsFromFile(
+        bytes,
+        picked.files.single.name,
+      );
+    } catch (error) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('批量导入失败：${controller.formatError(error)}'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
+    }
+    await navigator.push(
+      MaterialPageRoute<void>(
+        builder: (_) => BatchImportResultPage(result: result),
       ),
     );
   }
@@ -1080,8 +1345,9 @@ class _UserListItem extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final importedAccounts = parseImportedAccounts(user);
-    final abnormalTotal =
-        importedAccounts.where((entry) => entry.abnormal).length;
+    final abnormalTotal = importedAccounts
+        .where((entry) => entry.abnormal)
+        .length;
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
       decoration: BoxDecoration(
@@ -1383,6 +1649,135 @@ class _ImportedStatusBadge extends StatelessWidget {
           color: abnormal ? const Color(0xFFD92D20) : const Color(0xFF147850),
           fontSize: 12,
           fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+}
+
+/// 客户端批量导入的结果页：展示匹配/过滤/异常统计与命中明细，仅本地展示。
+class BatchImportResultPage extends StatelessWidget {
+  const BatchImportResultPage({super.key, required this.result});
+
+  final BatchImportResult result;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final entries = result.entries;
+    return Scaffold(
+      appBar: AppBar(title: const Text('批量导入结果')),
+      body: _AppBackground(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: _ImportedSummaryTile(
+                          label: '匹配成功',
+                          value: '${result.matched}',
+                          color: const Color(0xFF147850),
+                        ),
+                      ),
+                      Expanded(
+                        child: _ImportedSummaryTile(
+                          label: '已过滤',
+                          value: '${result.filtered}',
+                          color: const Color(0xFF152033),
+                        ),
+                      ),
+                      Expanded(
+                        child: _ImportedSummaryTile(
+                          label: '异常',
+                          value: '${result.abnormal}',
+                          color: const Color(0xFFD92D20),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  '共解析 ${result.totalRows} 行，匹配名单 ${result.matched} 个，'
+                  '过滤 ${result.filtered} 个。',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ),
+            Expanded(
+              child: entries.isEmpty
+                  ? Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Text(
+                          '暂无可导入的账号',
+                          textAlign: TextAlign.center,
+                          style: theme.textTheme.bodyLarge?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                    )
+                  : ListView.builder(
+                      padding: const EdgeInsets.all(16),
+                      itemCount: entries.length,
+                      itemBuilder: (context, index) {
+                        final entry = entries[index];
+                        return Container(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: const Color(0xFFE0E7F2)),
+                          ),
+                          child: Row(
+                            children: [
+                              SizedBox(
+                                width: 44,
+                                child: Text(
+                                  '${index + 1}',
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                              Expanded(
+                                child: Text(
+                                  entry.accountName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.bodyMedium?.copyWith(
+                                    color: const Color(0xFF152033),
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              _ImportedStatusBadge(abnormal: entry.abnormal),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
         ),
       ),
     );
@@ -1907,7 +2302,7 @@ class _WorkModeControlPageState extends State<WorkModeControlPage> {
                           ? null
                           : () => _setRunning(false),
                       icon: const Icon(Icons.pause_rounded),
-                      label: const Text('暂停增长'),
+                      label: const Text('暂停程序'),
                     ),
                   ),
                 ],
@@ -2030,7 +2425,7 @@ class _WorkModePageState extends State<WorkModePage> {
     lastFans = currentFans;
     addedFans = currentFans - startFans;
     logs.add(
-      '${_formatLogTime(DateTime.now())}：粉丝数新增 +$increment，累计新增 $addedFans',
+      '${_formatLogTime(DateTime.now())}：发送成功 +$increment，累计新增 $addedFans',
     );
     if (logs.length > 200) {
       logs.removeRange(0, logs.length - 200);
